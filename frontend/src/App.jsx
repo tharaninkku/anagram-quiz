@@ -2,6 +2,10 @@ import { useState, useEffect } from 'react'
 import './App.css'
 
 function App() {
+  // Connection state
+  const [isServerReady, setIsServerReady] = useState(false);
+  const [isConnectingError, setIsConnectingError] = useState(false);
+
   // Game state
   const [username, setUsername] = useState('');
   const [isGameStarted, setIsGameStarted] = useState(false);
@@ -9,7 +13,7 @@ function App() {
   const [answers, setAnswers] = useState([]);
   const [foundWords, setFoundWords] = useState([]);
   const [totalScore, setTotalScore] = useState(0); // Cumulative score accumulator
-  const [inputValue, setInputValue] = useState('');
+  const [usedIndices, setUsedIndices] = useState([]);
   const [wordLength, setWordLength] = useState(5);
   const [message, setMessage] = useState({ text: '', type: '' });
 
@@ -20,7 +24,39 @@ function App() {
   const [isLoadingLeaderboard, setIsLoadingLeaderboard] = useState(false);
 
   // Use Environment Variable for backend URL (fallback to localhost for local dev)
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+  // We use .replace(/\/$/, '') to ensure there's no trailing slash which causes 404s on Render!
+  const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '');
+
+  // Check backend server health on mount (wakes up sleeping Render instance)
+  useEffect(() => {
+    let active = true;
+    const checkHealth = async () => {
+      try {
+        const response = await fetch(`${API_URL}/api/health`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.status === 'ok' && active) {
+            setIsServerReady(true);
+            setIsConnectingError(false);
+            return;
+          }
+        }
+        throw new Error('Server not ready');
+      } catch (err) {
+        console.warn('Backend is waking up or database is sleeping. Retrying in 3 seconds...', err);
+        if (active) {
+          setIsConnectingError(true);
+          setTimeout(checkHealth, 3000);
+        }
+      }
+    };
+
+    checkHealth();
+
+    return () => {
+      active = false;
+    };
+  }, [active => active, API_URL]);
 
   // Fetch challenge from our Express Backend
   const fetchNewChallenge = async (len) => {
@@ -32,7 +68,7 @@ function App() {
       setLetters(data.letters);
       setAnswers(data.answers);
       setFoundWords([]);
-      setInputValue('');
+      setUsedIndices([]);
       setMessage({ text: 'Find as many anagrams as you can!', type: '' });
     } catch (err) {
       console.error(err);
@@ -140,10 +176,10 @@ function App() {
     fetchNewChallenge(wordLength);
   };
 
-  // Handle Guess Submission (Your work from yesterday!)
-  const handleGuessSubmit = (e) => {
-    e.preventDefault();
-    const guess = inputValue.trim().toUpperCase();
+  // Handle Guess Submission
+  const handleGuessSubmit = (customGuess) => {
+    // Determine the guess from parameters or derived states
+    const guess = (typeof customGuess === 'string' ? customGuess : usedIndices.map(idx => letters[idx]).join('')).trim().toUpperCase();
 
     if (!guess || isGameOver) return;
 
@@ -151,14 +187,67 @@ function App() {
       setFoundWords([...foundWords, guess]);
       setTotalScore((prev) => prev + 1); // Add +1 to cumulative score
       setMessage({ text: 'Correct!', type: 'success' });
-      setInputValue('');
+      setUsedIndices([]);
     } else if (answers.includes(guess)) {
       setMessage({ text: 'You already found that word!', type: 'error' });
-      setInputValue('');
+      setUsedIndices([]);
     } else {
       setMessage({ text: 'Not a valid word!', type: 'error' });
-      setInputValue('');
+      setUsedIndices([]);
     }
+  };
+
+  // Keyboard input listener
+  useEffect(() => {
+    if (!isGameStarted || isGameOver) return;
+
+    const handleKeyDown = (e) => {
+      // Ignore key events if the user is typing in a text field
+      if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') {
+        return;
+      }
+
+      const key = e.key.toUpperCase();
+
+      if (e.key === 'Backspace') {
+        setUsedIndices(prev => prev.slice(0, -1));
+        e.preventDefault();
+      } else if (e.key === 'Enter') {
+        handleGuessSubmit();
+        e.preventDefault();
+      } else if (/^[A-Z]$/.test(key)) {
+        // Find the first unused tile with this letter
+        const nextIndex = letters.findIndex((char, idx) => char.toUpperCase() === key && !usedIndices.includes(idx));
+        if (nextIndex !== -1) {
+          setUsedIndices(prev => [...prev, nextIndex]);
+        }
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isGameStarted, isGameOver, letters, usedIndices, answers, foundWords]);
+
+  // Handle clicking a tile in the letters pool
+  const handleTileClick = (index) => {
+    if (usedIndices.includes(index)) {
+      // Deselect tile (remove it from guess)
+      setUsedIndices(prev => prev.filter(i => i !== index));
+    } else {
+      // Select tile (append to guess)
+      setUsedIndices(prev => [...prev, index]);
+    }
+  };
+
+  // Remove a letter at a specific position in the guess preview
+  const handleRemoveTileAt = (posIndex) => {
+    setUsedIndices(prev => prev.filter((_, idx) => idx !== posIndex));
+  };
+
+  // Clear current guess
+  const handleClearCurrentGuess = () => {
+    setUsedIndices([]);
   };
 
   // Logout to change username
@@ -168,9 +257,25 @@ function App() {
     setIsGameOver(false);
     setTotalScore(0);
     setFoundWords([]);
-    setInputValue('');
+    setUsedIndices([]);
     setMessage({ text: '', type: '' });
-  };
+  };  // --- SCREEN 0: Connecting/Loading Screen ---
+  if (!isServerReady) {
+    return (
+      <div className="connecting-screen">
+        <div className="connecting-card">
+          <h1>Anagram Quiz</h1>
+          <div className="pulse-spinner"></div>
+          <p className="loading-status">Connecting to server...</p>
+          {isConnectingError && (
+            <p className="loading-tip">
+              💡 Render free instances spin down after inactivity. Waking up the server and connecting to the Neon database may take up to a minute. Thank you for your patience!
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // --- SCREEN 1: Username Setup Screen ---
   if (!isGameStarted) {
@@ -199,7 +304,11 @@ function App() {
             className="guess-input"
             placeholder="Your Username..."
             value={username}
-            onChange={(e) => setUsername(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              const cleaned = val.replace(/[^a-zA-Z0-9 _-]/g, '').slice(0, 15);
+              setUsername(cleaned);
+            }}
             required
           />
           <button type="submit" className="btn-primary">
@@ -228,29 +337,64 @@ function App() {
 
       <h1>Anagram Quiz</h1>
 
-      {/* Letter Bubbles */}
+      {/* Letter Pool Tiles */}
       <div className="letter-area">
-        {letters.map((letter, index) => (
-          <div key={index} className="letter-bubble">
-            {letter}
-          </div>
-        ))}
+        {letters.map((letter, index) => {
+          const isUsed = usedIndices.includes(index);
+          return (
+            <button
+              key={index}
+              disabled={isGameOver}
+              className={`letter-bubble ${isUsed ? 'used' : ''}`}
+              onClick={() => handleTileClick(index)}
+              title={isUsed ? "Deselect letter" : "Select letter"}
+            >
+              {letter}
+            </button>
+          );
+        })}
       </div>
 
-      {/* Guess Input Form (Disabled when Game Over) */}
-      <form onSubmit={handleGuessSubmit} className="guess-form">
-        <input
-          type="text"
-          disabled={isGameOver}
-          className="guess-input"
-          placeholder={isGameOver ? "Game Over" : "Type your word..."}
-          value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
-        />
-        <button type="submit" disabled={isGameOver} className="btn-primary">
+      {/* Visual Guess Preview */}
+      <div className={`guess-preview ${isGameOver ? 'disabled' : ''}`}>
+        {usedIndices.map((idx, index) => (
+          <button
+            key={index}
+            className="guess-tile-bubble"
+            disabled={isGameOver}
+            onClick={() => handleRemoveTileAt(index)}
+            title="Remove letter"
+          >
+            {letters[idx]}
+          </button>
+        ))}
+        {usedIndices.length === 0 && (
+          <span className="guess-placeholder">
+            {isGameOver ? "Game Over" : "Tap tiles or type to play"}
+          </span>
+        )}
+      </div>
+
+      {/* Controls for submitting/clearing guess */}
+      <div className="guess-controls" style={{ marginBottom: '25px', display: 'flex', gap: '15px', justifyContent: 'center' }}>
+        <button 
+          type="button" 
+          disabled={isGameOver || usedIndices.length === 0} 
+          className="btn-secondary" 
+          onClick={handleClearCurrentGuess}
+          style={{ marginTop: 0 }}
+        >
+          Clear
+        </button>
+        <button 
+          type="button" 
+          disabled={isGameOver || usedIndices.length === 0} 
+          className="btn-primary" 
+          onClick={() => handleGuessSubmit()}
+        >
           Submit
         </button>
-      </form>
+      </div>
 
       {/* Message Feedbacks */}
       {message.text && (
@@ -276,23 +420,23 @@ function App() {
       </div>
 
       {/* Action Buttons */}
-      <div style={{ display: 'flex', gap: '15px', justifyContent: 'center' }}>
+      <div className="action-buttons">
         {isGameOver ? (
           <>
-            <button className="btn-secondary" onClick={handlePlayAgain}>
+            <button className="btn-secondary" onClick={handlePlayAgain} style={{ marginTop: 0 }}>
               Play Again
             </button>
-            <button className="btn-secondary" style={{ borderColor: 'var(--error)', color: 'var(--error)' }} onClick={handleLogout}>
+            <button className="btn-secondary" style={{ borderColor: 'var(--error)', color: 'var(--error)', marginTop: 0 }} onClick={handleLogout}>
               Change Player
             </button>
           </>
         ) : (
-          <button className="btn-secondary" onClick={() => fetchNewChallenge(wordLength)}>
+          <button className="btn-secondary" onClick={() => fetchNewChallenge(wordLength)} style={{ marginTop: 0 }}>
             Skip / Next
           </button>
         )}
         {!isGameOver && (
-          <button className="btn-secondary" style={{ borderColor: 'var(--error)', color: 'var(--error)' }} onClick={handleGameOver}>
+          <button className="btn-secondary" style={{ borderColor: 'var(--error)', color: 'var(--error)', marginTop: 0 }} onClick={handleGameOver}>
             End Game
           </button>
         )}
@@ -300,7 +444,7 @@ function App() {
 
       {/* Leaderboard & Correct Answers (Displays when game is over) */}
       {isGameOver && (
-        <div className="found-section" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px', marginTop: '30px' }}>
+        <div className="game-over-panels">
           <div>
             <h2>🏆 Leaderboard</h2>
             <div style={{ textAlign: 'left', fontFamily: 'var(--font-mono)', fontSize: '0.9rem' }}>
@@ -357,7 +501,7 @@ function App() {
         </div>
       )}
     </div>
-  )
+  );
 }
 
 export default App

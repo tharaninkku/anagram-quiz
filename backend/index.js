@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import dotenv from 'dotenv';
+import rateLimit from 'express-rate-limit';
 
 dotenv.config();
 
@@ -13,6 +14,26 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 // express.json() lets Express read JSON data sent in request bodies
 app.use(express.json());
+
+// Rate Limiting Protection
+// General Rate Limiter: max 200 requests per 15 minutes per IP
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  message: { error: 'Too many requests from this IP, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(generalLimiter);
+
+// Score Submission Rate Limiter: max 10 score saves per 15 minutes per IP
+const scoreSubmitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many score submissions, please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Database connection pool
 const { Pool } = pg;
@@ -46,6 +67,18 @@ pool.query('SELECT NOW()', (err, res) => {
 // Default Root Route
 app.get('/', (req, res) => {
   res.send('Welcome to the Anagram Quiz API!');
+});
+
+// Health Check Route
+app.get('/api/health', async (req, res) => {
+  try {
+    // Run a fast query to check DB health
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    console.error('Health check failed:', err);
+    res.status(500).json({ status: 'error', database: 'disconnected', error: err.message });
+  }
 });
 
 // Helper function to scramble a word's letters
@@ -107,11 +140,35 @@ app.get('/api/challenge', async (req, res) => {
 });
 
 // Endpoint to save a user's score in the database
-app.post('/api/scores', async (req, res) => {
+app.post('/api/scores', scoreSubmitLimiter, async (req, res) => {
   const { username, score, timeTaken, wordLength } = req.body;
 
+  // 1. Basic validation checks
   if (!username || score === undefined) {
     return res.status(400).json({ error: 'Username and score are required' });
+  }
+
+  // 2. Strict Input Validation (Anti-Cheat & Sanitization)
+  const cleanUsername = username.trim();
+  const usernameRegex = /^[a-zA-Z0-9 _-]{2,15}$/;
+  if (!usernameRegex.test(cleanUsername)) {
+    return res.status(400).json({ 
+      error: 'Invalid username. Must be 2-15 characters and contain only letters, numbers, spaces, hyphens, or underscores.' 
+    });
+  }
+
+  const numScore = parseInt(score);
+  const numTime = parseInt(timeTaken) || 0;
+  const numLen = parseInt(wordLength) || 5;
+
+  if (isNaN(numScore) || numScore < 0 || numScore > 60) {
+    return res.status(400).json({ error: 'Invalid score value. Must be between 0 and 60.' });
+  }
+  if (isNaN(numTime) || numTime < 0 || numTime > 60) {
+    return res.status(400).json({ error: 'Invalid round duration.' });
+  }
+  if (isNaN(numLen) || numLen < 3 || numLen > 8) {
+    return res.status(400).json({ error: 'Invalid word length.' });
   }
 
   try {
@@ -119,42 +176,50 @@ app.post('/api/scores', async (req, res) => {
     // none of the database changes are saved (keeping our data clean!).
     await pool.query('BEGIN');
 
-    // ==========================================
-    // CHALLENGE 3: Insert the username into the 'users' table.
-    // If the username already exists (conflict), we shouldn't fail—we just update it
-    // with a dummy update and return the 'id' of that user.
-    //
-    // Hint: In PostgreSQL, you can use:
-    // INSERT INTO users (username) VALUES ($1)
-    // ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username
-    // RETURNING id;
-    // ==========================================
+    // Insert the username into the 'users' table.
     const userQuery = `
       INSERT INTO users (username) VALUES ($1)
-      ON CONFLICT (username) DO UPDATE SET  username = EXCLUDED.username
+      ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username
       RETURNING id;
     `;
-    const userResult = await pool.query(userQuery, [username.trim()]);
+    const userResult = await pool.query(userQuery, [cleanUsername]);
     const userId = userResult.rows[0].id;
 
-    // ==========================================
-    // CHALLENGE 4: Insert the score into the 'user_scores' table.
-    // Columns to insert: user_id, score, time_taken_seconds.
-    // Use $1, $2, $3 as placeholders for variables.
-    //
-    // Hint:
-    // INSERT INTO user_scores (user_id, score, time_taken_seconds) VALUES ($1, $2, $3)
-    // ==========================================
+    // Insert the score into the 'user_scores' table.
     const scoreQuery = `
       INSERT INTO user_scores (user_id, score, time_taken_seconds, word_length) VALUES ($1, $2, $3, $4);
     `;
-    await pool.query(scoreQuery, [userId, score, timeTaken || 0, wordLength || 5]);
+    await pool.query(scoreQuery, [userId, numScore, numTime, numLen]);
 
     // Update the user's overall accumulated score
     await pool.query(
       'UPDATE users SET total_score = total_score + $1 WHERE id = $2',
-      [score, userId]
+      [numScore, userId]
     );
+
+    // DATABASE SELF-CLEANING (PRUNING):
+    // Delete scores outside the top 100 for this difficulty to control storage growth
+    const pruneScoresQuery = `
+      DELETE FROM user_scores
+      WHERE word_length = $1 AND id NOT IN (
+        SELECT id FROM (
+          SELECT id FROM user_scores
+          WHERE word_length = $1
+          ORDER BY score DESC, created_at DESC
+          LIMIT 100
+        ) sub
+      );
+    `;
+    await pool.query(pruneScoresQuery, [numLen]);
+
+    // Delete users who no longer have any active score entries (orphans)
+    const pruneUsersQuery = `
+      DELETE FROM users
+      WHERE id NOT IN (
+        SELECT DISTINCT user_id FROM user_scores
+      );
+    `;
+    await pool.query(pruneUsersQuery);
 
     // Commit transaction
     await pool.query('COMMIT');
