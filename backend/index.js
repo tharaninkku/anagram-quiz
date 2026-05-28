@@ -9,6 +9,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Tell Express to trust the reverse proxy headers (Render uses a load balancer/reverse proxy)
+// This is critical for express-rate-limit to read the user's actual IP address rather than the proxy's!
+app.set('trust proxy', 1);
+
 // Middleware
 // CORS allows our React frontend (running on another port) to talk to this backend
 app.use(cors());
@@ -16,13 +20,14 @@ app.use(cors());
 app.use(express.json());
 
 // Rate Limiting Protection
-// General Rate Limiter: max 200 requests per 15 minutes per IP
+// General Rate Limiter: max 300 requests per 15 minutes per IP (excludes health check and root paths)
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: 300,
   message: { error: 'Too many requests from this IP, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.path === '/api/health' || req.path === '/',
 });
 app.use(generalLimiter);
 
