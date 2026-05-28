@@ -16,13 +16,23 @@ app.use(express.json());
 
 // Database connection pool
 const { Pool } = pg;
-const pool = new Pool({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_DATABASE,
-});
+
+// Use DATABASE_URL if available (for production like Render + Neon)
+// Otherwise fallback to local variables from .env
+const pool = new Pool(
+  process.env.DATABASE_URL 
+    ? { 
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false } 
+      }
+    : {
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        host: process.env.DB_HOST,
+        port: process.env.DB_PORT,
+        database: process.env.DB_DATABASE,
+      }
+);
 
 // Test database connection on startup
 pool.query('SELECT NOW()', (err, res) => {
